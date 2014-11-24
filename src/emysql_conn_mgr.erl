@@ -224,7 +224,7 @@ handle_call({remove_connections, PoolId, Num}, _From, State) ->
                 false ->
                     {Conns, OtherConns} = queue:split(Num, Pool#pool.available),
                     LockedLen = gb_trees:size(Pool#pool.locked),
-                    NowTcpConnSize = length(OtherConns) + LockedLen,
+                    NowTcpConnSize = queue:len(OtherConns) + LockedLen,
                     State1 = State#state{pools = [Pool#pool{available = OtherConns, size = NowTcpConnSize}|OtherPools]},
                     {reply, queue:to_list(Conns), State1}
             end;
