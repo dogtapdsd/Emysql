@@ -32,7 +32,9 @@
 -export([start_link/0, init/1, handle_call/3, handle_cast/2, handle_info/2]).
 -export([terminate/2, code_change/3]).
 
--export([pools/0, add_pool/1, has_pool/1,remove_pool/1,
+-export([
+        pools/0, add_pool/1, has_pool/1,remove_pool/1,
+        pool_size/1,
         add_connections/2, remove_connections/2,
         lock_connection/1, wait_for_connection/1, wait_for_connection/2,
         pass_connection/1, replace_connection_as_locked/2, replace_connection_as_available/2,
@@ -40,7 +42,7 @@
 
 -include("emysql.hrl").
 
--record(state, {pools, lockers = dict:new() :: dict()}).
+-record(state, {pools, lockers = dict:new() :: dict:dict()}).
 
 %%====================================================================
 %% API
@@ -63,6 +65,9 @@ has_pool(Pool) ->
 
 remove_pool(PoolId) ->
     do_gen_call({remove_pool, PoolId}).
+
+pool_size(PoolId) -> 
+    do_gen_call({pool_size, PoolId}).
 
 add_connections(PoolId, Conns) when is_list(Conns) ->
     do_gen_call({add_connections, PoolId, Conns}).
@@ -184,6 +189,14 @@ handle_call({remove_pool, PoolId}, _From, State) ->
             {reply, {error, pool_not_found}, State}
     end;
 
+handle_call({pool_size, PoolId}, _From, State) ->
+    case find_pool(PoolId, State#state.pools) of
+        {Pool, _OtherPools} ->
+            {reply, Pool#pool.size, State};
+        undefined ->
+            {reply, {error, pool_not_found}, State}
+    end;
+
 handle_call({add_connections, PoolId, Conns}, _From, State) ->
     case find_pool(PoolId, State#state.pools) of
         {Pool, OtherPools} ->
@@ -204,11 +217,15 @@ handle_call({remove_connections, PoolId, Num}, _From, State) ->
         {Pool, OtherPools} ->
             case Num > queue:len(Pool#pool.available) of
                 true ->
-                    State1 = State#state{pools = [Pool#pool{available = queue:new()}]},
+                    NowTcpConnSize = gb_trees:size(Pool#pool.locked), 
+                    NewPool = Pool#pool{available = queue:new(), size = NowTcpConnSize},
+                    State1 = State#state{pools = [NewPool | OtherPools]},
                     {reply, queue:to_list(Pool#pool.available), State1};
                 false ->
                     {Conns, OtherConns} = queue:split(Num, Pool#pool.available),
-                    State1 = State#state{pools = [Pool#pool{available = OtherConns}|OtherPools]},
+                    LockedLen = gb_trees:size(Pool#pool.locked),
+                    NowTcpConnSize = queue:len(OtherConns) + LockedLen,
+                    State1 = State#state{pools = [Pool#pool{available = OtherConns, size = NowTcpConnSize}|OtherPools]},
                     {reply, queue:to_list(Conns), State1}
             end;
         undefined ->
@@ -245,11 +262,11 @@ handle_call({abort_wait, PoolId}, {From, _Mref}, State) ->
             %% See if the length changed to know if From was removed.
             OldLen = queue:len(Pool#pool.waiting),
             NewLen = queue:len(QueueNow),
-            if
+            Reply = if
                 OldLen =:= NewLen ->
-                    Reply = not_waiting;
+                    not_waiting;
                 true ->
-                    Reply = ok
+                    ok
             end,
             {reply, Reply, State#state{pools=[PoolNow|OtherPools]}};
         undefined ->
@@ -269,21 +286,29 @@ handle_call({{replace_connection, Kind}, OldConn, NewConn}, _From, State) ->
 
     case find_pool(OldConn#emysql_connection.pool_id, State#state.pools) of
 	    {#pool{available = Available, locked = Locked} = Pool, Pools} ->
-		    OldRef = OldConn#emysql_connection.monitor_ref,
-                    Stripped = gb_trees:delete_any(OldConn#emysql_connection.id, Locked),
+		    OldRef   = OldConn#emysql_connection.monitor_ref,
+            Stripped = gb_trees:delete_any(OldConn#emysql_connection.id, Locked),
 		    {NewPool, NewMonitors} =
 			    case Kind of
 				    available ->
 					    serve_waiting_pids(
-					      Pool#pool { locked = Stripped,
+					      Pool#pool{ 
+                              locked = Stripped,
 							  available = queue:in(
-									NewConn#emysql_connection { locked_at = undefined,
-												    monitor_ref = undefined},
-									Available) });
+									NewConn#emysql_connection{
+                                        locked_at = undefined,
+										monitor_ref = undefined
+                                    },
+									Available) 
+                          }
+                        );
 				    locked ->
-					    {Pool#pool { locked = gb_trees:enter(NewConn#emysql_connection.id,
-										 NewConn#emysql_connection{monitor_ref = OldRef},
-										 Stripped) },
+					    {Pool#pool{
+                            locked = gb_trees:enter(
+                                NewConn#emysql_connection.id,
+								NewConn#emysql_connection{monitor_ref = OldRef},
+								Stripped) 
+                            },
 					     []} % There are no new monitors set up
 			    end,
 		    Lockers = State#state.lockers,
@@ -419,12 +444,14 @@ lock_next_connection(Available ,Locked, Who) ->
     end.
 
 connection_locked_at(Conn, MonitorRef) ->
-	Conn#emysql_connection{locked_at=lists:nth(2, tuple_to_list(now())),
+    {_MegaSecs, Secs, _MicroSecs} = erlang:now(),
+	Conn#emysql_connection{locked_at = Secs,
 			       monitor_ref = MonitorRef}.
 
 serve_waiting_pids(Pool) ->
     {Waiting, Available, Locked, NewRefs} = serve_waiting_pids(Pool#pool.waiting, Pool#pool.available, Pool#pool.locked, []),
-    {Pool#pool{waiting=Waiting, available=Available, locked=Locked}, NewRefs}.
+    NewConnSize = queue:len(Available) + gb_trees:size(Locked),
+    {Pool#pool{waiting = Waiting, available = Available, locked = Locked, size = NewConnSize}, NewRefs}.
 
 serve_waiting_pids(Waiting, Available, Locked, MonitorRefs) ->
     case queue:is_empty(Waiting) of
