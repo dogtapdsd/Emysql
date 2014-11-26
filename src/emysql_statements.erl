@@ -28,7 +28,7 @@
 -export([start_link/0, init/1, handle_call/3, handle_cast/2]).
 -export([handle_info/2, terminate/2, code_change/3]).
 
--export([all/0, fetch/1, add/2, version/2, prepare/3, remove/1]).
+-export([all/0, fetch/1, add/2, add_async/2, version/2, prepare/3, remove/1]).
 
 -include("emysql.hrl").
 
@@ -54,6 +54,9 @@ fetch(StmtName) ->
 
 add(StmtName, Statement) ->
     gen_server:call(?MODULE, {add, StmtName, Statement}, infinity).
+
+add_async(StmtName, Statement) -> 
+    erlang:send(?MODULE, {add_async, StmtName, Statement}).
 
 version(ConnId, StmtName) ->
     gen_server:call(?MODULE, {version, ConnId, StmtName}, infinity).
@@ -155,6 +158,22 @@ handle_cast(_Msg, State) ->
 %%                                       {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
+handle_info({add_async, StmtName, Statement}, State) -> 
+    State01 =
+        case lookup(StmtName, State#state.statements) of
+            undefined ->
+                State#state{
+                    statements = gb_trees:enter(StmtName, {1, Statement}, State#state.statements)
+                };
+            {_, Statement} ->
+                State;
+            {Version, _} ->
+                State#state{
+                    statements = gb_trees:enter(StmtName, {Version+1, Statement}, State#state.statements)
+                }
+        end,
+    {noreply, State01};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
