@@ -31,7 +31,8 @@
         open_connections/1, open_connection/1,
         reset_connection/3, close_connection/1,
         open_n_connections/2, hstate/1,
-        test_connection/2, need_test_connection/1
+        test_connection/2, need_test_connection/1,
+        encode/2
 ]).
 
 -include("emysql.hrl").
@@ -270,7 +271,7 @@ set_encoding_or_die(#emysql_connection { socket = Socket } = Connection, Encodin
             exit({failed_to_set_encoding, Err2#error_packet.msg})
     end.
  
-reset_connection(Pools, Conn, StayLocked) ->
+reset_connection(Pools, Conn = #emysql_connection{pool_id = PoolId}, StayLocked) ->
     %% if a process dies or times out while doing work
     %% the socket must be closed and the connection reset
     %% in the conn_mgr state. Also a new connection needs
@@ -282,7 +283,7 @@ reset_connection(Pools, Conn, StayLocked) ->
     MonitorRef = Conn#emysql_connection.monitor_ref,
     close_connection(Conn),
     %% OPEN NEW SOCKET
-    case emysql_conn_mgr:find_pool(Conn#emysql_connection.pool_id, Pools) of
+    case emysql_conn_mgr:find_pool(PoolId, Pools) of
         {Pool, _} ->
             case catch open_connection(Pool) of
                 #emysql_connection{} = NewConn when StayLocked == pass ->
@@ -306,6 +307,7 @@ add_monitor_ref(Conn, MonitorRef) ->
     Conn#emysql_connection{monitor_ref = MonitorRef}.
 
 close_connection(Conn) ->
+        emysql:is_commit_before_close(Conn),
 	%% garbage collect statements
 	emysql_statements:remove(Conn#emysql_connection.id),
 	ok = gen_tcp:close(Conn#emysql_connection.socket).
