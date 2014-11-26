@@ -102,15 +102,17 @@
 %% These are used to handle the life-cycle of the code base
 -export([   start/0, stop/0,
             add_pool/2,
-            add_pool/9,
+            add_pool/9, add_pool/10,
             add_pool/8, remove_pool/1, increment_pool_size/2, decrement_pool_size/2
 ]).
         
 %% Interaction API
 %% Used to interact with the database.    
 -export([
-            prepare/2,
-            execute/2, execute/3, execute/4, execute/5,
+            prepare/2, prepare_async/2,
+            execute/2, execute/3, execute/4,
+            execute/5,
+            transaction/3, is_commit_before_close/1,
             default_timeout/0
 ]).
 
@@ -261,7 +263,7 @@ add_pool(PoolId, Options) when is_list(Options) ->
     Host = proplists:get_value(host, Options, "127.0.0.1"),
     Port = proplists:get_value(port, Options, 3306),
     Database = proplists:get_value(database, Options, undefined),
-    Encoding = proplists:get_value(encoding, Options, latin1),
+    Encoding = proplists:get_value(encoding, Options, utf8),
     StartCmds = proplists:get_value(start_cmds, Options, []),
     ConnectTimeout = proplists:get_value(connect_timeout, Options, infinity),
     Warnings = proplists:get_value(warnings, Options, false),
@@ -476,6 +478,9 @@ decrement_pool_size(PoolId, Num) when is_integer(Num) ->
 prepare(StmtName, Statement) when is_atom(StmtName) andalso (is_list(Statement) orelse is_binary(Statement)) ->
     emysql_statements:add(StmtName, Statement).
 
+prepare_async(StmtName, Statement) when is_atom(StmtName) andalso (is_list(Statement) orelse is_binary(Statement)) ->
+    emysql_statements:add_async(StmtName, Statement).
+
 %% @spec execute(PoolId, Query|StmtName) -> Result | [Result]
 %%      PoolId = atom()
 %%      Query = binary() | string()
@@ -616,19 +621,169 @@ execute(PoolId, StmtName, Args, Timeout)
 %% @end doc: hd feb 11
 %%
 execute(PoolId, Query, Args, Timeout, nonblocking) when (is_list(Query) orelse is_binary(Query)) andalso is_list(Args) andalso (is_integer(Timeout) orelse Timeout == infinity) ->
-    case emysql_conn_mgr:lock_connection(PoolId) of
+    case queue_or_stay_conn(PoolId) of
         Connection when is_record(Connection, emysql_connection) ->
-            monitor_work(Connection, Timeout, [Connection, Query, Args]);
+            monitor_work(Connection, Timeout, [Connection, Query, Args], nonblocking);
         unavailable ->
             unavailable
     end;
 
 execute(PoolId, StmtName, Args, Timeout, nonblocking) when is_atom(StmtName), is_list(Args) andalso is_integer(Timeout) ->
-    case emysql_conn_mgr:lock_connection(PoolId) of
+    case queue_or_stay_conn(PoolId) of
         Connection when is_record(Connection, emysql_connection) ->
-            monitor_work(Connection, Timeout, [Connection, StmtName, Args]);
+            monitor_work(Connection, Timeout, [Connection, StmtName, Args], nonblocking);
         unavailable ->
             unavailable
+    end.
+
+queue_or_stay_conn(PoolId) ->
+    case dict_conn_get(PoolId) of
+    Connection = #emysql_connection{} -> 
+        Connection;
+    undefined -> 
+        emysql_conn_mgr:lock_connection(PoolId) 
+    end.
+
+%% @spec transaction(PoolId, Fun, Timeout) -> Result
+%%      PoolId = atom()
+%%      Fun = funtion() a closeure function with execute/5 , support INSERT INTO | UPDATE | DELETE | SELECT , 
+%%      Do not using DDL in this function 
+%%      return {error, Reason = term()} do rollback , any other Return = term() do commit
+%%
+%%      Timeout = integer() 
+%%      
+%%      Result  = {atomic, FunEvalResult} | {rollback, RollbackRet, Err}
+%%      FunEvalResult = term() Fun evaluate return Rest
+%%
+%%      RollbackRet   = {ok, AffRow} | {error, {SqlErrNo, SqlErrMsgStr}}    
+%%      Err     = {error, Resaon}
+%% @doc do transaction with closure Fun,  support no nesting
+%% @author dogtapdsd26@gmail.com
+transaction(PoolId, Fun, TimeOut) -> 
+    case begin_start(TimeOut, PoolId) of
+    {error, Reason} -> 
+        RollbackRet = rollback(TimeOut, PoolId),
+        {rollback, RollbackRet, Reason};
+    _BeginOk -> 
+        case catch Fun() of
+        {error, _Reason} = Err -> 
+            RollbackRet = rollback(TimeOut, PoolId),
+            {rollback, RollbackRet, Err};
+        {'EXIT', _} = Err -> 
+            RollbackRet = rollback(TimeOut, PoolId),
+            {rollback, RollbackRet, Err};
+        Res -> 
+            case commit(TimeOut, PoolId) of
+            {error, _Reason} = Err-> 
+                RollbackRet = rollback(TimeOut, PoolId),
+                {rollback, RollbackRet, Err};
+            {ok, _AffRow} -> 
+                {atomic, Res} 
+            end
+        end
+    end.
+
+%% keep different transaction of sessions(connections) in same isolation level 
+begin_start(TimeOut, PoolId) ->
+    declaration(<<"START TRANSACTION WITH CONSISTENT SNAPSHOT;">>, PoolId, TimeOut, start_transaction).
+
+commit(TimeOut, PoolId) ->
+    declaration(<<"COMMIT;">>, PoolId, TimeOut, commit).
+
+rollback(TimeOut, PoolId) -> 
+    declaration(<<"ROLLBACK;">>, PoolId, TimeOut, rollback).
+
+declaration(SqlStatement, PoolId, TimeOut, Declar) ->
+    %%io:format(" tsql: ~ts ~n", [SqlStatement]),
+    case execute_transaction(PoolId, SqlStatement, [], TimeOut, Declar) of
+    #ok_packet{
+        affected_rows = AffectedRows,
+        %%warning_count = _WarningCount,
+        msg           = _MsgString
+    } ->  
+        {ok, AffectedRows};
+    #error_packet{
+        code = ErrNo,
+        msg  = ErrMsgStr
+    } ->
+        {error, {ErrNo, ErrMsgStr}}
+    end.
+
+%% @doc use the same Connection execute transaction process, when after commit / rollback pass this Connection 
+execute_transaction(
+    PoolId, StmtNameOrQuery, Args, Timeout, Declaration
+) when ((is_list(StmtNameOrQuery) orelse is_binary(StmtNameOrQuery)) andalso is_list(Args) andalso (is_integer(Timeout) orelse Timeout == infinity))
+        orelse
+       (is_atom(StmtNameOrQuery) andalso is_list(Args) andalso is_integer(Timeout))
+->
+    case load_stay_conn(Declaration, PoolId) of
+        Connection when is_record(Connection, emysql_connection) ->
+            monitor_work(Connection, Timeout, [Connection, StmtNameOrQuery, Args], Declaration);
+        unavailable ->
+            unavailable
+    end.
+
+load_stay_conn(start_transaction, PoolId) -> 
+    case dict_conn_get(PoolId) of
+    undefined ->
+        case emysql_conn_mgr:lock_connection(PoolId) of
+            Connection = #emysql_connection{} -> 
+                Connection;
+            unavailable ->
+                unavailable     
+        end;
+    _Conn -> 
+        exit(re_transaction_start)
+    end;
+load_stay_conn(_OtherDeclaration, PoolId) ->
+    case dict_conn_get(PoolId) of
+    Connection = #emysql_connection{} -> 
+        Connection;
+    undefined -> 
+        exit(undef_transaction_start)
+    end.
+
+set_stay_conn(start_transaction, PoolId, Connection) -> 
+    dict_conn_set(PoolId, Connection);
+set_stay_conn(_OtherDeclaration, _PoolId, _Connoection) ->
+    pass.
+
+%% during transaction don't test connection
+is_no_transaction(PoolId) -> 
+    dict_conn_get(PoolId) =:= undefined.
+
+dict_conn_get(PoolId) -> 
+    erlang:get({'@transaction_conn', PoolId}).
+
+dict_conn_set(PoolId, Connection) -> 
+    erlang:put({'@transaction_conn',PoolId}, Connection).
+
+dict_conn_erase(PoolId) -> 
+    erlang:erase({'@transaction_conn',PoolId}).
+
+is_pass_conn(DeclarationAtom, PoolId, Connection) when DeclarationAtom =:= rollback; DeclarationAtom =:= commit -> 
+    dict_conn_erase(PoolId),   
+    emysql_conn_mgr:pass_connection(Connection),
+    pass_conn_ok;
+is_pass_conn(_DeclarationAtom, PoolId, Connection) ->
+    case dict_conn_get(PoolId) of
+    Connection ->     
+        hold;
+    undefined -> 
+        emysql_conn_mgr:pass_connection(Connection),
+        pass_conn_ok
+    end.
+    
+%% decrement_pool_size/2 only clear available connection 
+is_commit_before_close(Connection = #emysql_connection{pool_id = PoolId}) -> 
+    case dict_conn_get(PoolId) of
+    Connection ->
+        dict_conn_erase(PoolId),
+        emysql_conn:execute(Connection, <<"COMMIT;">>, []),
+        ok; 
+    _Other -> 
+        %%io:format("is_commit_before_close/2 ~w", [_Other]),
+        ignore
     end.
 
 %% @doc Return the field names of a result packet
@@ -669,7 +824,7 @@ result_type(#eof_packet{})    -> eof.
 -spec as_dict(Result) -> Dict
   when
     Result :: #result_packet{},
-    Dict :: dict().
+    Dict :: dict:dict().
 as_dict(Res) -> emysql_conv:as_dict(Res).
 
 
@@ -745,13 +900,17 @@ as_record(Res, Recname, Fields, Fun) -> emysql_conv:as_record(Res, Recname, Fiel
 %% @private
 %% @end doc: hd feb 11
 %%
-monitor_work(Connection0, Timeout, Args) when is_record(Connection0, emysql_connection) ->
-    Connection = case emysql_conn:need_test_connection(Connection0) of
+monitor_work(Connection = #emysql_connection{}, Timeout, Args) ->
+    monitor_work(Connection, Timeout, Args, blocking).
+
+monitor_work(Connection0 = #emysql_connection{pool_id = PoolId}, Timeout, Args, Declaration) when is_record(Connection0, emysql_connection) ->
+    Connection = case emysql_conn:need_test_connection(Connection0) andalso is_no_transaction(PoolId) of
        true ->
           emysql_conn:test_connection(Connection0, keep);
        false ->
           Connection0
     end,
+    set_stay_conn(Declaration, PoolId, Connection),
 
     %% spawn a new process to do work, then monitor that process until
     %% it either dies, returns data or times out.
@@ -759,7 +918,7 @@ monitor_work(Connection0, Timeout, Args) when is_record(Connection0, emysql_conn
     {Pid, Mref} = spawn_monitor(
                     fun() ->
                             put(query_arguments, Args),
-                            Parent ! {self(), apply(fun emysql_conn:execute/3, Args)}
+                            Parent ! {self(), erlang:apply(emysql_conn, execute, Args)}
                     end),
     receive
         {'DOWN', Mref, process, Pid, tcp_connection_closed} ->
@@ -767,7 +926,7 @@ monitor_work(Connection0, Timeout, Args) when is_record(Connection0, emysql_conn
                 NewConnection when is_record(NewConnection, emysql_connection) ->
                     %% re-loop, with new connection.
                     [_ | OtherArgs] = Args,
-                    monitor_work(NewConnection, Timeout , [NewConnection | OtherArgs]);
+                    monitor_work(NewConnection, Timeout , [NewConnection | OtherArgs], Declaration);
                 {error, FailedReset} ->
                     exit({connection_down, {and_conn_reset_failed, FailedReset}})
             end;
@@ -785,7 +944,7 @@ monitor_work(Connection0, Timeout, Args) when is_record(Connection0, emysql_conn
             %% connection and collect the normal 'DOWN'
             %% message send from the child process
             erlang:demonitor(Mref, [flush]),
-            emysql_conn_mgr:pass_connection(Connection),
+            is_pass_conn(Declaration, PoolId, Connection),
             Result
     after Timeout ->
         %% if we timeout waiting for the process to return,
@@ -795,3 +954,4 @@ monitor_work(Connection0, Timeout, Args) when is_record(Connection0, emysql_conn
         emysql_conn:reset_connection(emysql_conn_mgr:pools(), Connection, pass),
         exit(mysql_timeout)
     end.
+
