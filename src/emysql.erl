@@ -113,6 +113,7 @@
             execute/2, execute/3, execute/4,
             execute/5,
             transaction/3, is_commit_before_close/1,
+            deallocate_prepared_stmt/1, get_all_prepared_stmts/0,
             default_timeout/0
 ]).
 
@@ -644,6 +645,43 @@ queue_or_stay_conn(PoolId) ->
         emysql_conn_mgr:lock_connection(PoolId) 
     end.
 
+%%deallocate_prepared_stmt_test(PoolId) ->
+%%    case queue_or_stay_conn(PoolId) of
+%%    Connection = #emysql_connection{id = ConnId} ->
+%%        StmtsL = emysql_statements:remove(ConnId),   
+%%        io:format(" deallocate_prepared_stmt_test/1  ConnId:~ts, [~w] ~n", [ConnId, StmtsL]),
+%%        [emysql_conn:unprepare(Connection, StmtName) || StmtName <- StmtsL];
+%%    unavailable ->
+%%        unavailable
+%%    end.
+
+%% @spec deallocate_prepared_stmt(PoolId) -> empty | DoneUnPreparedNum 
+%%
+%% @doc
+deallocate_prepared_stmt(PoolId) ->
+    case emysql_conn_mgr:get_all_conns(PoolId) of
+    [] -> empty;
+    Connections ->
+        do_unprepare_all_conns_stmts(Connections, 0)
+    end.
+
+do_unprepare_all_conns_stmts([], DoneUnPreparedNum) -> 
+    DoneUnPreparedNum;
+do_unprepare_all_conns_stmts([Connection = #emysql_connection{id = ConnId} | T], DoneUnPreparedNum) -> 
+    StmtsL = emysql_statements:remove(ConnId),   
+    %% io:format("[~ts], stmts: ~w  ~n",[ConnId, StmtsL]),
+    [emysql_conn:unprepare(Connection, StmtName) || StmtName <- StmtsL],
+    do_unprepare_all_conns_stmts(T, DoneUnPreparedNum + erlang:length(StmtsL)).
+
+get_all_prepared_stmts() ->
+    Stmts = emysql_statements:all_prepared_stmts(),
+    flatten_statments(Stmts, []).
+
+flatten_statments([], DoneL) -> 
+    DoneL;
+flatten_statments([{_ConnId, Stmts} | T], DoneL) -> 
+    flatten_statments(T, [StmtName || {StmtName, _Version}<- Stmts] ++ DoneL).
+
 %% @spec transaction(PoolId, Fun, Timeout) -> Result
 %%      PoolId = atom()
 %%      Fun = funtion() a closeure function with execute/5 , support INSERT INTO | UPDATE | DELETE | SELECT , 
@@ -658,7 +696,6 @@ queue_or_stay_conn(PoolId) ->
 %%      RollbackRet   = {ok, AffRow} | {error, {SqlErrNo, SqlErrMsgStr}}    
 %%      Err     = {error, Resaon}
 %% @doc do transaction with closure Fun,  support no nesting
-%% @author dogtapdsd26@gmail.com
 transaction(PoolId, Fun, TimeOut) -> 
     case begin_start(TimeOut, PoolId) of
     {error, Reason} -> 

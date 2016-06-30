@@ -28,7 +28,7 @@
 -export([start_link/0, init/1, handle_call/3, handle_cast/2]).
 -export([handle_info/2, terminate/2, code_change/3]).
 
--export([all/0, fetch/1, add/2, add_async/2, version/2, prepare/3, remove/1]).
+-export([all/0, fetch/1, add/2, add_async/2, version/2, prepare/3, all_prepared_stmts/0, remove/1]).
 
 -include("emysql.hrl").
 
@@ -63,6 +63,9 @@ version(ConnId, StmtName) ->
 
 prepare(ConnId, StmtName, Version) ->
     gen_server:call(?MODULE, {prepare, ConnId, StmtName, Version}, infinity).
+
+all_prepared_stmts() -> 
+    gen_server:call(?MODULE, {all_prepared_stmts}).
 
 remove(ConnId) ->
     gen_server:call(?MODULE, {remove, ConnId}, infinity).
@@ -140,6 +143,12 @@ handle_call({remove, ConnId}, _From, State) ->
         end,
     Prepared = gb_trees:delete_any(ConnId, State#state.prepared),
     {reply, StmtNames, State#state{prepared=Prepared}};
+
+handle_call({all_prepared_stmts}, _From, State = #state{ prepared = GBPrepared }) -> 
+    AllPreparedStmts =  
+    [{ConnId, gb_trees:to_list(GBVerStmts)} || {ConnId, GBVerStmts} <- gb_trees:to_list(GBPrepared)], 
+
+    {reply, AllPreparedStmts, State};
 
 handle_call(_, _From, State) -> {reply, {error, invalid_call}, State}.
 

@@ -36,6 +36,7 @@
         pools/0, add_pool/1, has_pool/1,remove_pool/1,
         pool_size/1,
         add_connections/2, remove_connections/2,
+        get_all_conns/1,
         lock_connection/1, wait_for_connection/1, wait_for_connection/2,
         pass_connection/1, replace_connection_as_locked/2, replace_connection_as_available/2,
         find_pool/2, give_manager_control/1]).
@@ -74,6 +75,9 @@ add_connections(PoolId, Conns) when is_list(Conns) ->
 
 remove_connections(PoolId, Num) when is_integer(Num) ->
     do_gen_call({remove_connections, PoolId, Num}).
+
+get_all_conns(PoolId) ->
+    do_gen_call({get_all_conns, PoolId}).
 
 lock_connection(PoolId)->
 	do_gen_call({lock_connection, PoolId, false, self()}).
@@ -201,8 +205,8 @@ handle_call({add_connections, PoolId, Conns}, _From, State) ->
     case find_pool(PoolId, State#state.pools) of
         {Pool, OtherPools} ->
             Pool1 = Pool#pool{available = queue:join(queue:from_list(Conns), Pool#pool.available)},
-	    {NewPool, NewMonitorData} = serve_waiting_pids(Pool1),
-	    NewLockers = lists:foldl(fun({MonitorRef, ConnInfo}, Dict) ->
+	        {NewPool, NewMonitorData} = serve_waiting_pids(Pool1),
+	        NewLockers = lists:foldl(fun({MonitorRef, ConnInfo}, Dict) ->
 						     dict:store(MonitorRef, ConnInfo, Dict)
 				     end, State#state.lockers, NewMonitorData),
             State1 = State#state{pools = [NewPool|OtherPools],
@@ -231,6 +235,18 @@ handle_call({remove_connections, PoolId, Num}, _From, State) ->
         undefined ->
             {reply, {error, pool_not_found}, State}
     end;
+
+handle_call({get_all_conns, PoolId}, _From, State) ->
+    AllConns = case find_pool(PoolId, State#state.pools) of
+    {Pool, _OtherPools} ->
+        lists:append(
+            queue:to_list(Pool#pool.available),
+            gb_trees:values(Pool#pool.locked)
+        );
+    _ -> 
+        []
+    end,
+    {reply, AllConns, State};
 
 handle_call({lock_connection, PoolId, Wait, Who}, {From, _Mref}, State) ->
     case find_pool(PoolId, State#state.pools) of

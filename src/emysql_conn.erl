@@ -139,7 +139,9 @@ unprepare(Connection, Name) when is_atom(Name)->
     unprepare(Connection, atom_to_list(Name));
 unprepare(Connection, Name) ->
     Packet = <<?COM_QUERY, "DEALLOCATE PREPARE ", (list_to_binary(Name))/binary>>,  % todo: utf8?
-    send_recv(Connection, Packet).
+    Rtn = send_recv(Connection, Packet),
+    %%io:format(" unprepare/2 [~w] [~ts] ~w ~n", [Name, Packet, Rtn]),
+    Rtn.
 
 open_n_connections(PoolId, N) ->
     case emysql_conn_mgr:find_pool(PoolId, emysql_conn_mgr:pools()) of
@@ -307,9 +309,10 @@ add_monitor_ref(Conn, MonitorRef) ->
     Conn#emysql_connection{monitor_ref = MonitorRef}.
 
 close_connection(Conn) ->
-        emysql:is_commit_before_close(Conn),
+    emysql:is_commit_before_close(Conn),
 	%% garbage collect statements
-	emysql_statements:remove(Conn#emysql_connection.id),
+	PreparedStmts = emysql_statements:remove(Conn#emysql_connection.id),
+    [emysql_conn:unprepare(Conn, StmtName) || StmtName <- PreparedStmts], 
 	ok = gen_tcp:close(Conn#emysql_connection.socket).
 
 test_connection(Conn, StayLocked) ->
@@ -391,6 +394,10 @@ prepare_statement(Connection, StmtName) ->
                 Version ->
                     ok;
                 _ ->
+                    case Version =/= 1 of
+                    true  -> unprepare(Connection, StmtName);
+                    false -> ignore
+                    end,
                     ok = prepare(Connection, StmtName, Statement),
                     emysql_statements:prepare(Connection#emysql_connection.id, StmtName, Version)
             end
