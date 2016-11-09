@@ -56,6 +56,8 @@ response_list(Sock, DefaultTimeout, ServerStatus) ->
     response_list(Sock, DefaultTimeout, ServerStatus, <<>>).
 
 response_list(_, _DefaultTimeout, 0, <<>>) -> [];  %%no further data received after last response.
+response_list(Sock, DefaultTimeout, 0, Buff) ->
+    response_list(Sock, DefaultTimeout, ?SERVER_MORE_RESULTS_EXIST, Buff); %% may be infinity loop?
 
 response_list(Sock, DefaultTimeout, ?SERVER_MORE_RESULTS_EXIST, Buff) ->
     {Packet, Rest} = recv_packet(Sock, DefaultTimeout, Buff),
