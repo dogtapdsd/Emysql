@@ -37,9 +37,13 @@
         pool_size/1,
         add_connections/2, remove_connections/2,
         get_all_conns/1,
-        lock_connection/1, wait_for_connection/1, wait_for_connection/2,
-        pass_connection/1, replace_connection_as_locked/2, replace_connection_as_available/2,
-        find_pool/2, give_manager_control/1]).
+        
+        lock_connection_hold/1, lock_connection/1, 
+        wait_for_connection/1, wait_for_connection/2,
+        pass_connection_hold/1, pass_connection/1,
+        replace_connection_as_locked/2, replace_connection_as_available/2,
+        find_pool/2, give_manager_control/1, get_connection_hold_status/1
+    ]).
 
 -include("emysql.hrl").
 
@@ -79,8 +83,11 @@ remove_connections(PoolId, Num) when is_integer(Num) ->
 get_all_conns(PoolId) ->
     do_gen_call({get_all_conns, PoolId}).
 
+lock_connection_hold(PoolId)->
+	do_gen_call({lock_connection, PoolId, false, self(), true}).
+
 lock_connection(PoolId)->
-	do_gen_call({lock_connection, PoolId, false, self()}).
+	do_gen_call({lock_connection, PoolId, false, self(), false}).
 
 wait_for_connection(PoolId)->
 	wait_for_connection(PoolId, lock_timeout()).
@@ -89,7 +96,7 @@ wait_for_connection(PoolId ,Timeout)->
     %% try to lock a connection. if no connections are available then
     %% wait to be notified of the next available connection
     %-% io:format("~p waits for connection to pool ~p~n", [self(), PoolId]),
-    case do_gen_call({lock_connection, PoolId, true, self()}) of
+    case do_gen_call({lock_connection, PoolId, true, self(), false}) of
         unavailable ->
             %-% io:format("~p is queued~n", [self()]),
             receive
@@ -107,14 +114,21 @@ wait_for_connection(PoolId ,Timeout)->
             Connection
     end.
 
+
+pass_connection_hold(Connection) ->
+    do_gen_call({{replace_connection, available, true}, Connection, Connection}).
+
+get_connection_hold_status(ConnectionUid) -> 
+    do_gen_call({get_connection_hold_status, ConnectionUid}).
+
 pass_connection(Connection) ->
-    do_gen_call({{replace_connection, available}, Connection, Connection}).
+    do_gen_call({{replace_connection, available, false}, Connection, Connection}).
 
 replace_connection_as_available(OldConn, NewConn) ->
-    do_gen_call({{replace_connection, available}, OldConn, NewConn}).
+    do_gen_call({{replace_connection, available, false}, OldConn, NewConn}).
 
 replace_connection_as_locked(OldConn, NewConn) ->
-    do_gen_call({{replace_connection, locked}, OldConn, NewConn}).
+    do_gen_call({{replace_connection, locked, false}, OldConn, NewConn}).
 
 give_manager_control(Socket) ->
 	case whereis(?MODULE) of
@@ -248,12 +262,13 @@ handle_call({get_all_conns, PoolId}, _From, State) ->
     end,
     {reply, AllConns, State};
 
-handle_call({lock_connection, PoolId, Wait, Who}, {From, _Mref}, State) ->
+handle_call({lock_connection, PoolId, Wait, Who, IsTransactionHold}, {From, _Mref}, State) ->
     case find_pool(PoolId, State#state.pools) of
         {Pool, OtherPools} ->
             case lock_next_connection(Pool, Who) of
                 {ok, Connection, PoolNow, {MonitorRef, Data}} ->
-		    Lockers = State#state.lockers,
+		            Lockers = State#state.lockers,
+                    set_connect_hold(IsTransactionHold, Connection),
                     {reply, Connection, State#state{pools=[PoolNow|OtherPools],
 						    lockers = dict:store(MonitorRef, Data, Lockers)}};
                 unavailable when Wait =:= true ->
@@ -290,7 +305,7 @@ handle_call({abort_wait, PoolId}, {From, _Mref}, State) ->
     end;
 
 
-handle_call({{replace_connection, Kind}, OldConn, NewConn}, _From, State) ->
+handle_call({{replace_connection, Kind, IsEraseTracation}, OldConn, NewConn}, _From, State) ->
     %% if an error occurs while doing work over a connection then
     %% the connection must be closed and a new one created in its
     %% place. The calling process is responsible for creating the
@@ -340,11 +355,18 @@ handle_call({{replace_connection, Kind}, OldConn, NewConn}, _From, State) ->
 						 %% We need to keep the monitor here
 						 dict:store(OldRef, {NewConn#emysql_connection.pool_id, NewConn#emysql_connection.id}, Lockers)
 				 end,
+
+            erase_conncect_hold(IsEraseTracation, OldConn),
+
 		    {reply, ok, State#state{pools = [NewPool|Pools],
 					    lockers = NewLockers}};
 	   undefined ->
 		    {reply, {error, pool_not_found}, State}
     end;
+
+handle_call({get_connection_hold_status, ConnectionUid}, _From, State) -> 
+    Reply = now_connect_hold_status(ConnectionUid),
+    {reply, Reply, State};
 
 handle_call(_, _From, State) -> {reply, {error, invalid_call}, State}.
 
@@ -441,7 +463,7 @@ find_pool(PoolId, [Pool|Tail], OtherPools) ->
 lock_next_connection(Pool, Who) ->
 	case lock_next_connection(Pool#pool.available, Pool#pool.locked, Who) of
 		{ok, Connection, OtherAvailable, NewLocked, MonitorTuple} ->
-			{ok ,Connection ,Pool#pool{available=OtherAvailable, locked=NewLocked}, MonitorTuple};
+			{ok ,Connection, Pool#pool{available=OtherAvailable, locked=NewLocked}, MonitorTuple};
 		unavailable ->
 			unavailable
 	end.
@@ -460,8 +482,7 @@ lock_next_connection(Available ,Locked, Who) ->
     end.
 
 connection_locked_at(Conn, MonitorRef) ->
-    {_MegaSecs, Secs, _MicroSecs} = erlang:now(),
-	Conn#emysql_connection{locked_at = Secs,
+    Conn#emysql_connection{locked_at = emysql_conn:now_seconds(),
 			       monitor_ref = MonitorRef}.
 
 serve_waiting_pids(Pool) ->
@@ -492,3 +513,22 @@ serve_waiting_pids(Waiting, Available, Locked, MonitorRefs) ->
 
 lock_timeout() ->
     emysql_app:lock_timeout().
+
+set_connect_hold(true, #emysql_connection{id = PortUnqId}) ->
+    %%io:format("~ts set hold = true ~n", [PortUnqId]),
+    erlang:put({'hold_connect', PortUnqId}, true),
+    ok;
+set_connect_hold(_IsTransactionHold, _Connection) ->
+    ignore. 
+
+erase_conncect_hold(true, #emysql_connection{id = PortUnqId}) -> 
+    %%io:format("~ts set hold = false ~n", [PortUnqId]),
+    erlang:erase({'hold_connect', PortUnqId});
+erase_conncect_hold(_IsEraseTracation, _Connection) ->
+    ignore.
+
+now_connect_hold_status(ConnectionUid) -> 
+    case erlang:get({'hold_connect', ConnectionUid}) of
+    undefined  -> false;
+    ConnStatus -> ConnStatus
+    end.
