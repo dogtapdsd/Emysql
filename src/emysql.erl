@@ -669,8 +669,9 @@ do_unprepare_all_conns_stmts([], DoneUnPreparedNum) ->
     DoneUnPreparedNum;
 do_unprepare_all_conns_stmts([Connection = #emysql_connection{id = ConnId} | T], DoneUnPreparedNum) -> 
     StmtsL = emysql_statements:remove(ConnId),   
-    %% io:format("[~ts], stmts: ~w  ~n",[ConnId, StmtsL]),
+   
     [emysql_conn:unprepare(Connection, StmtName) || StmtName <- StmtsL],
+    %%io:format("~p, ~n",[UnpResult]),
     do_unprepare_all_conns_stmts(T, DoneUnPreparedNum + erlang:length(StmtsL)).
 
 get_all_prepared_stmts() ->
@@ -733,6 +734,12 @@ rollback(TimeOut, PoolId) ->
 declaration(SqlStatement, PoolId, TimeOut, Declar) ->
     %%io:format(" tsql: ~ts ~n", [SqlStatement]),
     case execute_transaction(PoolId, SqlStatement, [], TimeOut, Declar) of
+    [#ok_packet{
+        affected_rows = AffectedRows,
+        %%warning_count = _WarningCount,
+        msg           = _MsgString
+    }|_] -> 
+        {ok, AffectedRows};
     #ok_packet{
         affected_rows = AffectedRows,
         %%warning_count = _WarningCount,
@@ -763,21 +770,21 @@ execute_transaction(
 load_stay_conn(start_transaction, PoolId) -> 
     case dict_conn_get(PoolId) of
     undefined ->
-        case emysql_conn_mgr:lock_connection(PoolId) of
+        case emysql_conn_mgr:lock_connection_hold(PoolId) of
             Connection = #emysql_connection{} -> 
                 Connection;
             unavailable ->
                 unavailable     
         end;
     _Conn -> 
-        exit(re_transaction_start)
+        exit({re_transaction_start, PoolId})
     end;
 load_stay_conn(_OtherDeclaration, PoolId) ->
     case dict_conn_get(PoolId) of
     Connection = #emysql_connection{} -> 
         Connection;
     undefined -> 
-        exit(undef_transaction_start)
+        exit({no_transaction_start, _OtherDeclaration})
     end.
 
 set_stay_conn(start_transaction, PoolId, Connection) -> 
@@ -800,7 +807,7 @@ dict_conn_erase(PoolId) ->
 
 is_pass_conn(DeclarationAtom, PoolId, Connection) when DeclarationAtom =:= rollback; DeclarationAtom =:= commit -> 
     dict_conn_erase(PoolId),   
-    emysql_conn_mgr:pass_connection(Connection),
+    emysql_conn_mgr:pass_connection_hold(Connection),
     pass_conn_ok;
 is_pass_conn(_DeclarationAtom, PoolId, Connection) ->
     case dict_conn_get(PoolId) of
@@ -812,15 +819,19 @@ is_pass_conn(_DeclarationAtom, PoolId, Connection) ->
     end.
     
 %% decrement_pool_size/2 only clear available connection 
-is_commit_before_close(Connection = #emysql_connection{pool_id = PoolId}) -> 
+is_commit_before_close(Connection = #emysql_connection{pool_id = PoolId, id = PortUnqId}) -> 
     case dict_conn_get(PoolId) of
     Connection ->
         dict_conn_erase(PoolId),
         emysql_conn:execute(Connection, <<"COMMIT;">>, []),
         ok; 
     _Other -> 
+        case emysql_conn_mgr:get_connection_hold_status(PortUnqId) of
+        true  -> emysql_conn:execute(Connection, <<"COMMIT;">>, []); %% when close connect from other process, check this connecion's hold status(is in trancactioning)
+        false -> ignore
+        end,
         %%io:format("is_commit_before_close/2 ~w", [_Other]),
-        ignore
+        ok
     end.
 
 %% @doc Return the field names of a result packet
@@ -947,6 +958,8 @@ monitor_work(Connection0 = #emysql_connection{pool_id = PoolId}, Timeout, Args, 
        false ->
           Connection0
     end,
+
+    %% may be after tcp_connection_closed set new Connection from Declaration
     set_stay_conn(Declaration, PoolId, Connection),
 
     %% spawn a new process to do work, then monitor that process until
@@ -991,4 +1004,3 @@ monitor_work(Connection0 = #emysql_connection{pool_id = PoolId}, Timeout, Args, 
         emysql_conn:reset_connection(emysql_conn_mgr:pools(), Connection, pass),
         exit(mysql_timeout)
     end.
-
